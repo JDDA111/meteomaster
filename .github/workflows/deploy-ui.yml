@@ -1,0 +1,69 @@
+name: Deploy UI changes
+
+# Redespliega solo el frontend (site/index.html, etc.) reusando los frames
+# que la build manual ya descargo y dejo en cache. No descarga nada nuevo
+# de meteociel.
+
+on:
+  push:
+    branches: [claude/main]
+    paths:
+      - 'site/index.html'
+      - 'site/**'
+      - '!site/frames/**'
+      - '.github/workflows/deploy-ui.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore latest frames from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: site/frames
+          key: gfs-frames-deploy-${{ github.run_id }}
+          restore-keys: |
+            gfs-frames-
+
+      - name: Show what we have
+        run: |
+          if [ -f site/frames/manifest.json ]; then
+            echo "Frames cache restored:"
+            python3 -c "import json; m=json.load(open('site/frames/manifest.json')); s=m['stats']; print(f\"  map_param: {m['map_param']}, target: {m['target']}, ok: {s['ok']}/{s['total_candidates']}\")"
+            echo "  files: $(ls site/frames/*.png 2>/dev/null | wc -l) png(s)"
+          else
+            echo "WARNING: no cached frames found. The page will load but show no data."
+            echo "Run the 'Build GFS forecast evolution' workflow once to populate the cache."
+            mkdir -p site/frames
+            echo '{"frames":[],"stats":{"ok":0,"fail":0,"total_candidates":0},"map_param":"","target":"","target_date":"","target_hour":0,"days_back":0,"generated_at":""}' > site/frames/manifest.json
+            echo "(no log)" > site/frames/log.txt
+          fi
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
