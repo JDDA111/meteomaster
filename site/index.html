@@ -18,32 +18,55 @@
   .meta code { background: var(--panel); padding: 1px 6px; border-radius: 4px; font-size: 12px; }
   .viewer { position: relative; background: var(--panel); border: 1px solid var(--border);
             border-radius: 8px; overflow: hidden; min-height: 400px;
-            display: flex; align-items: center; justify-content: center; }
+            display: flex; align-items: center; justify-content: center;
+            cursor: crosshair; }
   .viewer img { max-width: 100%; height: auto; display: block; }
   .overlay { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.75);
              padding: 6px 10px; border-radius: 6px; font-family: ui-monospace, monospace;
              font-size: 12px; pointer-events: none; }
-  .controls { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
-  .controls input[type=range] { flex: 1; }
+  .marker { position: absolute; width: 14px; height: 14px; border: 2px solid #ffd33d;
+            border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none;
+            box-shadow: 0 0 0 1px rgba(0,0,0,0.6), 0 0 8px rgba(255,211,61,0.6); }
+  .controls { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+  .controls input[type=range] { flex: 1; min-width: 150px; }
   .controls button { background: var(--panel); color: var(--text); border: 1px solid var(--border);
                      padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
                      min-width: 90px; }
   .controls button:hover { border-color: var(--accent); }
+  .controls button:disabled { opacity: 0.5; cursor: not-allowed; }
   .readout { font-family: ui-monospace, monospace; font-size: 13px; min-width: 70px; text-align: right; }
   details { margin-top: 1rem; font-size: 12px; color: var(--muted); }
   details pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
                 padding: 10px; max-height: 300px; overflow: auto; font-size: 11px; line-height: 1.5; }
   .err { color: var(--err); }
   .ok { color: var(--ok); }
+
+  .chart-card { margin-top: 1rem; background: var(--panel); border: 1px solid var(--border);
+                border-radius: 8px; padding: 1rem; }
+  .chart-head { display: flex; justify-content: space-between; align-items: center;
+                margin-bottom: 8px; font-size: 13px; }
+  .chart-head .info { font-family: ui-monospace, monospace; color: var(--muted); }
+  .chart-head .legend { display: flex; gap: 12px; font-size: 12px; }
+  .chart-head .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+                        vertical-align: middle; margin-right: 4px; }
+  #chart { width: 100%; height: 280px; display: block; }
+  .chart-axis { stroke: var(--muted); stroke-width: 1; }
+  .chart-grid { stroke: var(--border); stroke-width: 0.5; }
+  .chart-line { stroke-width: 1.5; fill: none; }
+  .chart-dot { stroke-width: 0; }
+  .chart-label { fill: var(--muted); font-size: 10px; font-family: ui-monospace, monospace; }
+  .chart-current { stroke: #ffd33d; stroke-width: 1; stroke-dasharray: 3,3; }
+  .hint { color: var(--muted); font-size: 12px; font-style: italic; }
 </style>
 </head>
 <body>
 <h1>GFS forecast evolution animator</h1>
 <div id="meta" class="meta">Cargando manifest...</div>
 
-<div class="viewer">
+<div class="viewer" id="viewer">
   <img id="map" alt="Mapa GFS">
   <div id="overlay" class="overlay"></div>
+  <div id="marker" class="marker" hidden></div>
 </div>
 
 <div class="controls">
@@ -56,7 +79,19 @@
   <span style="font-size: 13px; color: var(--muted);">Velocidad</span>
   <input type="range" id="speed" min="100" max="2000" value="500" step="50">
   <span class="readout" id="speed-readout">500 ms</span>
+  <button id="clearPoint" disabled>Quitar punto</button>
 </div>
+
+<div class="chart-card" id="chartCard" hidden>
+  <div class="chart-head">
+    <div class="info" id="pointInfo"></div>
+    <div class="legend" id="chartLegend"></div>
+  </div>
+  <svg id="chart" viewBox="0 0 800 280" preserveAspectRatio="none"></svg>
+  <div class="hint" id="chartHint"></div>
+</div>
+
+<p id="clickHint" class="hint">Haz click en el mapa para ver la evolucion del valor en ese punto.</p>
 
 <details>
   <summary style="cursor: pointer;">Log de descarga</summary>
@@ -67,20 +102,222 @@
 (async function() {
   const meta = document.getElementById('meta');
   const map = document.getElementById('map');
+  const viewer = document.getElementById('viewer');
   const overlay = document.getElementById('overlay');
+  const marker = document.getElementById('marker');
   const slider = document.getElementById('slider');
   const readout = document.getElementById('readout');
   const playBtn = document.getElementById('play');
   const speedEl = document.getElementById('speed');
   const speedReadout = document.getElementById('speed-readout');
   const logEl = document.getElementById('log');
+  const chartCard = document.getElementById('chartCard');
+  const chartEl = document.getElementById('chart');
+  const chartLegend = document.getElementById('chartLegend');
+  const pointInfo = document.getElementById('pointInfo');
+  const chartHint = document.getElementById('chartHint');
+  const clickHint = document.getElementById('clickHint');
+  const clearBtn = document.getElementById('clearPoint');
 
-  let frames = [], idx = 0, playing = false, timer = null;
+  let frames = [], idx = 0, playing = false, timer = null, mapParam = '';
+  let pickedRatio = null;
+  let imgCache = new Map();
+
+  // Paletas RGB -> valor para mapas conocidos.
+  // Aproximaciones a partir de las escalas de meteociel; ajustables si hace falta.
+  const PALETTES = {
+    'gfs-1': {
+      unit: 'mm',
+      label: 'Precipitacion',
+      scale: [
+        [255, 255, 255, 0],
+        [220, 240, 255, 0.2],
+        [170, 220, 255, 0.5],
+        [110, 180, 245, 1],
+        [60, 130, 220, 2],
+        [40, 90, 200, 5],
+        [40, 170, 60, 10],
+        [220, 200, 40, 20],
+        [240, 130, 30, 40],
+        [220, 40, 40, 80],
+        [160, 30, 130, 150],
+        [80, 0, 80, 250],
+      ],
+    },
+  };
+
+  function loadFrame(file) {
+    if (imgCache.has(file)) return imgCache.get(file);
+    const p = new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('load failed: ' + file));
+      img.src = 'frames/' + file;
+    });
+    imgCache.set(file, p);
+    return p;
+  }
+
+  function rgbToValue(r, g, b, palette) {
+    if (!palette) return null;
+    let bestDist = Infinity, bestVal = null;
+    for (const entry of palette.scale) {
+      const d = (entry[0]-r)**2 + (entry[1]-g)**2 + (entry[2]-b)**2;
+      if (d < bestDist) { bestDist = d; bestVal = entry[3]; }
+    }
+    return { value: bestVal, dist: Math.sqrt(bestDist) };
+  }
+
+  async function sampleAtPoint(xRatio, yRatio) {
+    const samples = [];
+    const tasks = frames.map(async (f) => {
+      try {
+        const img = await loadFrame(f.file);
+        const w = img.naturalWidth, h = img.naturalHeight;
+        const px = Math.max(0, Math.min(w - 1, Math.round(xRatio * w)));
+        const py = Math.max(0, Math.min(h - 1, Math.round(yRatio * h)));
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        const d = ctx.getImageData(px, py, 1, 1).data;
+        return { frame: f, r: d[0], g: d[1], b: d[2], px, py };
+      } catch (e) {
+        return null;
+      }
+    });
+    const results = await Promise.all(tasks);
+    return results.filter(Boolean);
+  }
+
+  function renderChart(samples) {
+    const palette = PALETTES[mapParam];
+    chartLegend.innerHTML = '';
+    chartHint.textContent = '';
+
+    const W = 800, H = 280, padL = 50, padR = 20, padT = 15, padB = 40;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+    const n = samples.length;
+    if (!n) { chartEl.innerHTML = ''; return; }
+
+    let series, yMin, yMax, yLabel;
+
+    if (palette) {
+      series = [{
+        name: palette.label + ' (' + palette.unit + ')',
+        color: '#58a6ff',
+        values: samples.map(s => rgbToValue(s.r, s.g, s.b, palette).value),
+      }];
+      yLabel = palette.unit;
+      yMin = 0;
+      yMax = Math.max(1, ...series[0].values);
+      const maxDist = Math.max(...samples.map(s => rgbToValue(s.r, s.g, s.b, palette).dist));
+      chartHint.textContent = 'Estimacion por LUT (distancia maxima color: ' + Math.round(maxDist) + '). ' +
+        'Si los colores del punto no estan en la paleta, el valor puede ser inexacto.';
+    } else {
+      series = [
+        { name: 'R', color: '#f85149', values: samples.map(s => s.r) },
+        { name: 'G', color: '#3fb950', values: samples.map(s => s.g) },
+        { name: 'B', color: '#58a6ff', values: samples.map(s => s.b) },
+      ];
+      yLabel = 'RGB (0-255)';
+      yMin = 0; yMax = 255;
+      chartHint.textContent = 'Sin paleta definida para "' + mapParam + '". Mostrando RGB crudo del pixel.';
+    }
+
+    series.forEach(s => {
+      const sw = '<span class="swatch" style="background:' + s.color + '"></span>';
+      chartLegend.innerHTML += '<span>' + sw + s.name + '</span>';
+    });
+
+    const xAt = i => padL + (n === 1 ? innerW/2 : (i / (n-1)) * innerW);
+    const yAt = v => padT + innerH - ((v - yMin) / (yMax - yMin || 1)) * innerH;
+
+    let svg = '';
+
+    // grid + ejes
+    const yTicks = 5;
+    for (let t = 0; t <= yTicks; t++) {
+      const v = yMin + (yMax - yMin) * (t / yTicks);
+      const y = yAt(v);
+      svg += `<line class="chart-grid" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;
+      svg += `<text class="chart-label" x="${padL-6}" y="${y+3}" text-anchor="end">${v.toFixed(v<10?1:0)}</text>`;
+    }
+    svg += `<text class="chart-label" x="10" y="${padT+innerH/2}" transform="rotate(-90 10 ${padT+innerH/2})" text-anchor="middle">${yLabel}</text>`;
+
+    // etiquetas X (run datetime)
+    const labelEvery = Math.max(1, Math.ceil(n / 8));
+    samples.forEach((s, i) => {
+      if (i % labelEvery !== 0 && i !== n-1) return;
+      const d = new Date(s.frame.run);
+      const pad = x => String(x).padStart(2,'0');
+      const lbl = `${pad(d.getUTCDate())}/${pad(d.getUTCMonth()+1)} ${pad(d.getUTCHours())}Z`;
+      svg += `<text class="chart-label" x="${xAt(i)}" y="${H-padB+15}" text-anchor="middle">${lbl}</text>`;
+    });
+
+    // linea actual
+    if (idx >= 0 && idx < n) {
+      svg += `<line class="chart-current" x1="${xAt(idx)}" y1="${padT}" x2="${xAt(idx)}" y2="${padT+innerH}"/>`;
+    }
+
+    // series
+    series.forEach(s => {
+      const path = s.values.map((v, i) => `${i?'L':'M'}${xAt(i)},${yAt(v)}`).join(' ');
+      svg += `<path class="chart-line" stroke="${s.color}" d="${path}"/>`;
+      s.values.forEach((v, i) => {
+        svg += `<circle class="chart-dot" cx="${xAt(i)}" cy="${yAt(v)}" r="2.5" fill="${s.color}"/>`;
+      });
+    });
+
+    // ejes
+    svg += `<line class="chart-axis" x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT+innerH}"/>`;
+    svg += `<line class="chart-axis" x1="${padL}" y1="${padT+innerH}" x2="${W-padR}" y2="${padT+innerH}"/>`;
+
+    chartEl.innerHTML = svg;
+  }
+
+  let lastSamples = null;
+  async function pickPoint(xRatio, yRatio) {
+    pickedRatio = { x: xRatio, y: yRatio };
+    updateMarker();
+    clearBtn.disabled = false;
+    clickHint.hidden = true;
+    chartCard.hidden = false;
+    pointInfo.textContent = `Muestreando ${frames.length} frames...`;
+    chartEl.innerHTML = '';
+    try {
+      const samples = await sampleAtPoint(xRatio, yRatio);
+      lastSamples = samples;
+      pointInfo.textContent = `Punto (${(xRatio*100).toFixed(1)}%, ${(yRatio*100).toFixed(1)}%) · ${samples.length} muestras`;
+      renderChart(samples);
+    } catch (e) {
+      pointInfo.textContent = 'Error: ' + e.message;
+    }
+  }
+
+  function updateMarker() {
+    if (!pickedRatio) { marker.hidden = true; return; }
+    const r = map.getBoundingClientRect();
+    const v = viewer.getBoundingClientRect();
+    marker.style.left = (r.left - v.left + pickedRatio.x * r.width) + 'px';
+    marker.style.top = (r.top - v.top + pickedRatio.y * r.height) + 'px';
+    marker.hidden = false;
+  }
+
+  function clearPick() {
+    pickedRatio = null;
+    lastSamples = null;
+    marker.hidden = true;
+    chartCard.hidden = true;
+    clearBtn.disabled = true;
+    clickHint.hidden = false;
+  }
 
   try {
     const r = await fetch('frames/manifest.json');
     const manifest = await r.json();
     frames = manifest.frames || [];
+    mapParam = manifest.map_param || '';
     const s = manifest.stats || {};
     meta.innerHTML = `
       Objetivo: <code>${manifest.target_date} ${String(manifest.target_hour).padStart(2,'0')}Z</code> ·
@@ -118,6 +355,7 @@
     overlay.textContent = `Run ${runStr} · +${f.fh}h`;
     slider.value = idx;
     readout.textContent = `${idx+1} / ${frames.length}`;
+    if (lastSamples) renderChart(lastSamples);
   }
 
   function step() { show((idx + 1) % frames.length); }
@@ -139,6 +377,18 @@
     speedReadout.textContent = `${e.target.value} ms`;
     if (playing) { stop(); play(); }
   };
+  clearBtn.onclick = clearPick;
+
+  viewer.addEventListener('click', e => {
+    const r = map.getBoundingClientRect();
+    const x = e.clientX - r.left;
+    const y = e.clientY - r.top;
+    if (x < 0 || y < 0 || x > r.width || y > r.height) return;
+    pickPoint(x / r.width, y / r.height);
+  });
+
+  map.addEventListener('load', updateMarker);
+  window.addEventListener('resize', updateMarker);
 
   document.addEventListener('keydown', e => {
     if (e.key === ' ') { e.preventDefault(); playing ? stop() : play(); }
