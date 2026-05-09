@@ -81,12 +81,27 @@ def main():
     session.headers.update(HEADERS)
 
     frames = []
-    ok, fail = 0, 0
+    ok, fail, cached = 0, 0, 0
     for run_dt, fh in candidates:
         stamp = run_dt.strftime("%Y%m%d%H")
         url = f"{ARCHIVE_BASE}/{stamp}/{args.map_param}-{fh}.png"
         fname = f"{stamp}_fh{fh:03d}.png"
         fpath = out_dir / fname
+
+        if fpath.exists() and fpath.stat().st_size > 1000:
+            size = fpath.stat().st_size
+            frames.append({
+                "file": fname,
+                "run": run_dt.isoformat(),
+                "run_stamp": stamp,
+                "fh": fh,
+                "size": size,
+                "cached": True,
+            })
+            cached += 1
+            ok += 1
+            log(f"HIT  {stamp} +{fh:>3}h  {size//1024}KB  (cache)")
+            continue
 
         try:
             r = session.get(url, timeout=20)
@@ -101,7 +116,7 @@ def main():
                     "size": len(r.content),
                 })
                 ok += 1
-                log(f"OK  {stamp} +{fh:>3}h  {len(r.content)//1024}KB  {url}")
+                log(f"OK   {stamp} +{fh:>3}h  {len(r.content)//1024}KB  {url}")
             else:
                 fail += 1
                 log(f"SKIP {stamp} +{fh:>3}h  HTTP {r.status_code} ct={ct} len={len(r.content)}  {url}")
@@ -118,12 +133,12 @@ def main():
         "target_hour": args.target_hour,
         "days_back": args.days_back,
         "map_param": args.map_param,
-        "stats": {"ok": ok, "fail": fail, "total_candidates": len(candidates)},
+        "stats": {"ok": ok, "fail": fail, "cached": cached, "downloaded": ok - cached, "total_candidates": len(candidates)},
         "frames": frames,
     }
 
     Path(args.manifest).write_text(json.dumps(manifest, indent=2))
-    log(f"Done: {ok} OK, {fail} failed. Manifest: {args.manifest}")
+    log(f"Done: {ok} OK ({cached} cached, {ok - cached} downloaded), {fail} failed. Manifest: {args.manifest}")
 
     log_path.write_text("\n".join(log_lines) + "\n")
 

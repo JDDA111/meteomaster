@@ -323,7 +323,7 @@
       Objetivo: <code>${manifest.target_date} ${String(manifest.target_hour).padStart(2,'0')}Z</code> ·
       Mapa: <code>${manifest.map_param}</code> ·
       Archivo: ${manifest.days_back} dias ·
-      <span class="ok">${s.ok} OK</span> / <span class="err">${s.fail} fail</span> de ${s.total_candidates} ·
+      <span class="ok">${s.ok} OK</span> (${s.cached ?? 0} cache, ${s.downloaded ?? s.ok} new) / <span class="err">${s.fail} fail</span> de ${s.total_candidates} ·
       Generado ${new Date(manifest.generated_at).toLocaleString()}
     `;
   } catch (e) {

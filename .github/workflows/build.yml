@@ -44,6 +44,16 @@ jobs:
       - name: Install requests
         run: pip install requests
 
+      - name: Restore frames cache
+        id: frames-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: site/frames
+          key: gfs-frames-${{ inputs.map_param }}-${{ github.run_id }}
+          restore-keys: |
+            gfs-frames-${{ inputs.map_param }}-
+            gfs-frames-
+
       - name: Download forecast frames
         run: |
           python scripts/fetch_frames.py \
@@ -54,6 +64,13 @@ jobs:
             --out-dir site/frames \
             --manifest site/frames/manifest.json \
             --log site/frames/log.txt
+
+      - name: Save frames cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: site/frames
+          key: gfs-frames-${{ inputs.map_param }}-${{ github.run_id }}
 
       - name: Show log tail
         if: always()
