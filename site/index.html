@@ -398,20 +398,9 @@
       projection = { pts, asymptote: dampedAsymptote(des) };
     }
 
-    let yMin = Math.min(...validPts.map(p => p.v));
-    let yMax = Math.max(...validPts.map(p => p.v));
-    if (projection) {
-      for (const p of projection.pts) {
-        yMin = Math.min(yMin, p.v);
-        yMax = Math.max(yMax, p.v);
-      }
-    }
-    const yPad = (yMax - yMin || 1) * 0.08;
-    yMin -= yPad; yMax += yPad;
-
+    const yMin = info.vmin;
+    const yMax = info.vmax;
     const yT = niceTicks(yMin, yMax, 8);
-    yMin = Math.min(yMin, yT.ticks[0]);
-    yMax = Math.max(yMax, yT.ticks[yT.ticks.length-1]);
 
     const xAt = t => padL + ((t - tMin) / (tMax - tMin || 1)) * innerW;
     const yAt = v => padT + innerH - ((v - yMin) / (yMax - yMin || 1)) * innerH;
@@ -426,6 +415,7 @@
     const fmtY = v => v.toFixed(decimals);
 
     let svg = '';
+    svg += `<defs><clipPath id="plotArea"><rect x="${padL}" y="${padT}" width="${innerW}" height="${innerH}"/></clipPath></defs>`;
 
     // Y grid + labels
     yT.ticks.forEach(v => {
@@ -495,12 +485,12 @@
         areaPath += `L${xAt(p.t)},${yAt(yMin)} L${xAt(segStart)},${yAt(yMin)} Z `;
       }
     });
-    if (areaPath) svg += `<path class="chart-area" d="${areaPath}"/>`;
+    if (areaPath) svg += `<path class="chart-area" d="${areaPath}" clip-path="url(#plotArea)"/>`;
 
     // Curva proyectada (Holt damped trend) desde el ultimo dato hasta el target.
     if (projection && projection.pts.length > 1) {
       const d = projection.pts.map((p, i) => (i ? 'L' : 'M') + xAt(p.t) + ',' + yAt(p.v)).join(' ');
-      svg += `<path class="chart-trend" d="${d}"/>`;
+      svg += `<path class="chart-trend" d="${d}" clip-path="url(#plotArea)"/>`;
       // Asintota: linea horizontal hasta el target si esta dentro del rango visible.
       if (projection.asymptote != null &&
           projection.asymptote >= yMin && projection.asymptote <= yMax) {
@@ -517,7 +507,7 @@
       pathD += (penDown ? 'L' : 'M') + xAt(p.t) + ',' + yAt(p.v) + ' ';
       penDown = true;
     });
-    svg += `<path class="chart-line" d="${pathD}"/>`;
+    svg += `<path class="chart-line" d="${pathD}" clip-path="url(#plotArea)"/>`;
 
     // Puntos
     points.forEach(p => {
