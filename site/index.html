@@ -122,29 +122,28 @@
   let frames = [], idx = 0, playing = false, timer = null, mapParam = '';
   let pickedRatio = null;
   let imgCache = new Map();
+  let colorbar = null;
 
-  // Paletas RGB -> valor para mapas conocidos.
-  // Aproximaciones a partir de las escalas de meteociel; ajustables si hace falta.
-  const PALETTES = {
-    'gfs-1': {
-      unit: 'mm',
-      label: 'Precipitacion',
-      scale: [
-        [255, 255, 255, 0],
-        [220, 240, 255, 0.2],
-        [170, 220, 255, 0.5],
-        [110, 180, 245, 1],
-        [60, 130, 220, 2],
-        [40, 90, 200, 5],
-        [40, 170, 60, 10],
-        [220, 200, 40, 20],
-        [240, 130, 30, 40],
-        [220, 40, 40, 80],
-        [160, 30, 130, 150],
-        [80, 0, 80, 250],
-      ],
-    },
+  // Configuracion de campo + rango de la barra de colores por map_param.
+  // vmin/vmax = valores numericos en los extremos izquierdo y derecho de la barra.
+  // Si los valores absolutos no cuadran, ajusta aqui los limites.
+  const MAP_INFO = {
+    'gfs-0':  { field: 'Z500',          unit: 'dam', vmin: 480,  vmax: 600 },
+    'gfs-1':  { field: 'Precipitacion', unit: 'mm',  vmin: 0,    vmax: 250 },
+    'gfs-2':  { field: 'T 850hPa',      unit: 'C',   vmin: -40,  vmax: 30  },
+    'gfs-3':  { field: 'T 2m',          unit: 'C',   vmin: -40,  vmax: 40  },
   };
+  const DEFAULT_INFO = { field: 'valor', unit: '', vmin: 0, vmax: 1 };
+
+  const SAMPLE_RADIUS = 2;          // 5x5 = (2*r+1)^2
+  const WHITE_THRESH = 240;         // pixel "blanco" si todos los canales > umbral
+
+  function isWhite(r, g, b) {
+    return r >= WHITE_THRESH && g >= WHITE_THRESH && b >= WHITE_THRESH;
+  }
+  function isBlack(r, g, b) {
+    return r < 30 && g < 30 && b < 30;
+  }
 
   function loadFrame(file) {
     if (imgCache.has(file)) return imgCache.get(file);
@@ -158,94 +157,172 @@
     return p;
   }
 
-  function rgbToValue(r, g, b, palette) {
-    if (!palette) return null;
-    let bestDist = Infinity, bestVal = null;
-    for (const entry of palette.scale) {
-      const d = (entry[0]-r)**2 + (entry[1]-g)**2 + (entry[2]-b)**2;
-      if (d < bestDist) { bestDist = d; bestVal = entry[3]; }
+  // Detecta una banda horizontal continua de colores variados en la parte
+  // baja de la imagen (la barra de la leyenda) y devuelve una LUT con
+  // muestras (r, g, b, t) donde t es la posicion normalizada [0, 1].
+  async function buildColorbar() {
+    if (!frames.length) return null;
+    const img = await loadFrame(frames[0].file);
+    const w = img.naturalWidth, h = img.naturalHeight;
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    const data = ctx.getImageData(0, 0, w, h).data;
+
+    // Buscar la fila con mas variedad de color en el 25% inferior.
+    const startY = Math.floor(h * 0.75);
+    let bestRow = -1, bestVariety = 0;
+    for (let y = startY; y < h; y++) {
+      const seen = new Set();
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        const r = data[i], g = data[i+1], b = data[i+2];
+        if (isWhite(r,g,b) || isBlack(r,g,b)) continue;
+        seen.add(((r>>3)<<10) | ((g>>3)<<5) | (b>>3));
+      }
+      if (seen.size > bestVariety) {
+        bestVariety = seen.size;
+        bestRow = y;
+      }
     }
-    return { value: bestVal, dist: Math.sqrt(bestDist) };
+    if (bestRow < 0 || bestVariety < 8) return null;
+
+    // Bordes izq/der de la barra: extremos no blancos en esa fila.
+    let left = -1, right = -1;
+    for (let x = 0; x < w; x++) {
+      const i = (bestRow * w + x) * 4;
+      const r = data[i], g = data[i+1], b = data[i+2];
+      if (!isWhite(r,g,b) && !isBlack(r,g,b)) {
+        if (left < 0) left = x;
+        right = x;
+      }
+    }
+    if (right - left < 50) return null;
+
+    // Promedio vertical de 3 filas para reducir ruido.
+    const samples = [];
+    for (let x = left; x <= right; x++) {
+      let R = 0, G = 0, B = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const y = bestRow + dy;
+        if (y < 0 || y >= h) continue;
+        const i = (y * w + x) * 4;
+        const r = data[i], g = data[i+1], b = data[i+2];
+        if (isWhite(r,g,b) || isBlack(r,g,b)) continue;
+        R += r; G += g; B += b; n++;
+      }
+      if (n > 0) {
+        samples.push({
+          r: R/n, g: G/n, b: B/n,
+          t: (x - left) / (right - left),
+        });
+      }
+    }
+    if (samples.length < 20) return null;
+    return { y: bestRow, left, right, samples };
   }
 
+  // Encuentra el color mas cercano en la LUT y devuelve su valor interpolado.
+  function pixelToValue(r, g, b, info) {
+    if (!colorbar) return null;
+    let bestDist = Infinity, bestT = 0;
+    for (const s of colorbar.samples) {
+      const d = (s.r-r)**2 + (s.g-g)**2 + (s.b-b)**2;
+      if (d < bestDist) { bestDist = d; bestT = s.t; }
+    }
+    return {
+      value: info.vmin + bestT * (info.vmax - info.vmin),
+      dist: Math.sqrt(bestDist),
+    };
+  }
+
+  // Muestrea un parche 5x5, descarta blancos y promedia el valor.
   async function sampleAtPoint(xRatio, yRatio) {
-    const samples = [];
+    const info = MAP_INFO[mapParam] || DEFAULT_INFO;
     const tasks = frames.map(async (f) => {
       try {
         const img = await loadFrame(f.file);
         const w = img.naturalWidth, h = img.naturalHeight;
-        const px = Math.max(0, Math.min(w - 1, Math.round(xRatio * w)));
-        const py = Math.max(0, Math.min(h - 1, Math.round(yRatio * h)));
+        const cx = Math.round(xRatio * w);
+        const cy = Math.round(yRatio * h);
+        const x0 = Math.max(0, cx - SAMPLE_RADIUS);
+        const y0 = Math.max(0, cy - SAMPLE_RADIUS);
+        const x1 = Math.min(w - 1, cx + SAMPLE_RADIUS);
+        const y1 = Math.min(h - 1, cy + SAMPLE_RADIUS);
         const c = document.createElement('canvas');
         c.width = w; c.height = h;
         const ctx = c.getContext('2d');
         ctx.drawImage(img, 0, 0);
-        const d = ctx.getImageData(px, py, 1, 1).data;
-        return { frame: f, r: d[0], g: d[1], b: d[2], px, py };
+        const patch = ctx.getImageData(x0, y0, x1-x0+1, y1-y0+1).data;
+
+        const values = [];
+        let maxDist = 0;
+        for (let i = 0; i < patch.length; i += 4) {
+          const r = patch[i], g = patch[i+1], b = patch[i+2];
+          if (isWhite(r, g, b)) continue;
+          const v = pixelToValue(r, g, b, info);
+          if (v == null) continue;
+          values.push(v.value);
+          if (v.dist > maxDist) maxDist = v.dist;
+        }
+
+        if (!values.length) return { frame: f, value: null, count: 0 };
+        const avg = values.reduce((a, b) => a + b, 0) / values.length;
+        return { frame: f, value: avg, count: values.length, maxDist };
       } catch (e) {
-        return null;
+        return { frame: f, value: null, count: 0 };
       }
     });
-    const results = await Promise.all(tasks);
-    return results.filter(Boolean);
+    return Promise.all(tasks);
   }
 
   function renderChart(samples) {
-    const palette = PALETTES[mapParam];
+    const info = MAP_INFO[mapParam] || DEFAULT_INFO;
     chartLegend.innerHTML = '';
     chartHint.textContent = '';
 
-    const W = 800, H = 280, padL = 50, padR = 20, padT = 15, padB = 40;
+    const W = 800, H = 280, padL = 60, padR = 20, padT = 15, padB = 40;
     const innerW = W - padL - padR, innerH = H - padT - padB;
     const n = samples.length;
     if (!n) { chartEl.innerHTML = ''; return; }
 
-    let series, yMin, yMax, yLabel;
-
-    if (palette) {
-      series = [{
-        name: palette.label + ' (' + palette.unit + ')',
-        color: '#58a6ff',
-        values: samples.map(s => rgbToValue(s.r, s.g, s.b, palette).value),
-      }];
-      yLabel = palette.unit;
-      yMin = 0;
-      yMax = Math.max(1, ...series[0].values);
-      const maxDist = Math.max(...samples.map(s => rgbToValue(s.r, s.g, s.b, palette).dist));
-      chartHint.textContent = 'Estimacion por LUT (distancia maxima color: ' + Math.round(maxDist) + '). ' +
-        'Si los colores del punto no estan en la paleta, el valor puede ser inexacto.';
-    } else {
-      series = [
-        { name: 'R', color: '#f85149', values: samples.map(s => s.r) },
-        { name: 'G', color: '#3fb950', values: samples.map(s => s.g) },
-        { name: 'B', color: '#58a6ff', values: samples.map(s => s.b) },
-      ];
-      yLabel = 'RGB (0-255)';
-      yMin = 0; yMax = 255;
-      chartHint.textContent = 'Sin paleta definida para "' + mapParam + '". Mostrando RGB crudo del pixel.';
+    const valid = samples.filter(s => s.value != null);
+    if (!valid.length) {
+      chartEl.innerHTML = '';
+      chartHint.textContent = 'Todos los pixeles del parche eran blancos. Prueba un punto distinto.';
+      return;
     }
 
-    series.forEach(s => {
-      const sw = '<span class="swatch" style="background:' + s.color + '"></span>';
-      chartLegend.innerHTML += '<span>' + sw + s.name + '</span>';
-    });
+    let yMin = Math.min(...valid.map(s => s.value));
+    let yMax = Math.max(...valid.map(s => s.value));
+    const span = yMax - yMin || 1;
+    yMin -= span * 0.1;
+    yMax += span * 0.1;
+
+    const seriesLabel = `${info.field} (${info.unit})`;
+    chartLegend.innerHTML = `<span><span class="swatch" style="background:#58a6ff"></span>${seriesLabel}</span>`;
+
+    const avgCount = (samples.reduce((a, s) => a + (s.count||0), 0) / n).toFixed(1);
+    const maxDist = Math.max(...samples.map(s => s.maxDist || 0));
+    chartHint.textContent = `Parche 5x5, blancos descartados (~${avgCount} px utiles/frame). ` +
+      `Rango LUT: ${info.vmin}-${info.vmax} ${info.unit}. ` +
+      `Distancia max color->LUT: ${Math.round(maxDist)}.`;
 
     const xAt = i => padL + (n === 1 ? innerW/2 : (i / (n-1)) * innerW);
     const yAt = v => padT + innerH - ((v - yMin) / (yMax - yMin || 1)) * innerH;
 
     let svg = '';
 
-    // grid + ejes
     const yTicks = 5;
     for (let t = 0; t <= yTicks; t++) {
       const v = yMin + (yMax - yMin) * (t / yTicks);
       const y = yAt(v);
       svg += `<line class="chart-grid" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;
-      svg += `<text class="chart-label" x="${padL-6}" y="${y+3}" text-anchor="end">${v.toFixed(v<10?1:0)}</text>`;
+      svg += `<text class="chart-label" x="${padL-6}" y="${y+3}" text-anchor="end">${v.toFixed(1)}</text>`;
     }
-    svg += `<text class="chart-label" x="10" y="${padT+innerH/2}" transform="rotate(-90 10 ${padT+innerH/2})" text-anchor="middle">${yLabel}</text>`;
+    svg += `<text class="chart-label" x="14" y="${padT+innerH/2}" transform="rotate(-90 14 ${padT+innerH/2})" text-anchor="middle">${info.unit || 'valor'}</text>`;
 
-    // etiquetas X (run datetime)
     const labelEvery = Math.max(1, Math.ceil(n / 8));
     samples.forEach((s, i) => {
       if (i % labelEvery !== 0 && i !== n-1) return;
@@ -255,21 +332,23 @@
       svg += `<text class="chart-label" x="${xAt(i)}" y="${H-padB+15}" text-anchor="middle">${lbl}</text>`;
     });
 
-    // linea actual
     if (idx >= 0 && idx < n) {
       svg += `<line class="chart-current" x1="${xAt(idx)}" y1="${padT}" x2="${xAt(idx)}" y2="${padT+innerH}"/>`;
     }
 
-    // series
-    series.forEach(s => {
-      const path = s.values.map((v, i) => `${i?'L':'M'}${xAt(i)},${yAt(v)}`).join(' ');
-      svg += `<path class="chart-line" stroke="${s.color}" d="${path}"/>`;
-      s.values.forEach((v, i) => {
-        svg += `<circle class="chart-dot" cx="${xAt(i)}" cy="${yAt(v)}" r="2.5" fill="${s.color}"/>`;
-      });
+    // Linea + puntos, conectando solo segmentos con valor valido.
+    let pathD = '', penDown = false;
+    samples.forEach((s, i) => {
+      if (s.value == null) { penDown = false; return; }
+      pathD += (penDown ? 'L' : 'M') + xAt(i) + ',' + yAt(s.value) + ' ';
+      penDown = true;
+    });
+    svg += `<path class="chart-line" stroke="#58a6ff" d="${pathD}"/>`;
+    samples.forEach((s, i) => {
+      if (s.value == null) return;
+      svg += `<circle class="chart-dot" cx="${xAt(i)}" cy="${yAt(s.value)}" r="2.5" fill="#58a6ff"/>`;
     });
 
-    // ejes
     svg += `<line class="chart-axis" x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT+innerH}"/>`;
     svg += `<line class="chart-axis" x1="${padL}" y1="${padT+innerH}" x2="${W-padR}" y2="${padT+innerH}"/>`;
 
@@ -283,6 +362,18 @@
     clearBtn.disabled = false;
     clickHint.hidden = true;
     chartCard.hidden = false;
+    if (!colorbar) {
+      pointInfo.textContent = 'Detectando barra de colores...';
+      try {
+        colorbar = await buildColorbar();
+      } catch (e) {
+        colorbar = null;
+      }
+      if (!colorbar) {
+        pointInfo.textContent = 'No se ha podido detectar la barra de colores en la imagen.';
+        return;
+      }
+    }
     pointInfo.textContent = `Muestreando ${frames.length} frames...`;
     chartEl.innerHTML = '';
     try {
