@@ -49,13 +49,20 @@
   .chart-head .legend { display: flex; gap: 12px; font-size: 12px; }
   .chart-head .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
                         vertical-align: middle; margin-right: 4px; }
-  #chart { width: 100%; height: 280px; display: block; }
+  #chart { width: 100%; height: 320px; display: block; }
   .chart-axis { stroke: var(--muted); stroke-width: 1; }
-  .chart-grid { stroke: var(--border); stroke-width: 0.5; }
-  .chart-line { stroke-width: 1.5; fill: none; }
-  .chart-dot { stroke-width: 0; }
+  .chart-tick { stroke: var(--muted); stroke-width: 1; }
+  .chart-grid { stroke: var(--border); stroke-width: 0.5; stroke-dasharray: 2,3; opacity: 0.7; }
+  .chart-line { stroke: #58a6ff; stroke-width: 1.8; fill: none; stroke-linejoin: round; stroke-linecap: round; }
+  .chart-area { fill: rgba(88,166,255,0.12); stroke: none; }
+  .chart-trend { stroke: #ffa657; stroke-width: 1.6; stroke-dasharray: 6,4; opacity: 0.95; }
+  .chart-dot { fill: #58a6ff; stroke: #0e1116; stroke-width: 1; }
   .chart-label { fill: var(--muted); font-size: 10px; font-family: ui-monospace, monospace; }
-  .chart-current { stroke: #ffd33d; stroke-width: 1; stroke-dasharray: 3,3; }
+  .chart-label-strong { fill: var(--text); font-weight: 600; }
+  .chart-axis-title { fill: var(--text); font-size: 11px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .chart-current { stroke: #ffd33d; stroke-width: 1.2; stroke-dasharray: 3,3; opacity: 0.85; }
+  .chart-today { stroke: #f85149; stroke-width: 1; stroke-dasharray: 5,3; opacity: 0.85; }
+  .chart-today-label { fill: #f85149; font-weight: 600; font-size: 10px; }
   .hint { color: var(--muted); font-size: 12px; font-style: italic; }
 </style>
 </head>
@@ -87,7 +94,7 @@
     <div class="info" id="pointInfo"></div>
     <div class="legend" id="chartLegend"></div>
   </div>
-  <svg id="chart" viewBox="0 0 800 280" preserveAspectRatio="none"></svg>
+  <svg id="chart" viewBox="0 0 900 320" preserveAspectRatio="xMidYMid meet"></svg>
   <div class="hint" id="chartHint"></div>
 </div>
 
@@ -260,7 +267,7 @@
         let maxDist = 0;
         for (let i = 0; i < patch.length; i += 4) {
           const r = patch[i], g = patch[i+1], b = patch[i+2];
-          if (isWhite(r, g, b)) continue;
+          if (isWhite(r, g, b) || isBlack(r, g, b)) continue;
           const v = pixelToValue(r, g, b, info);
           if (v == null) continue;
           values.push(v.value);
@@ -277,12 +284,36 @@
     return Promise.all(tasks);
   }
 
+  function niceTicks(min, max, target) {
+    const span = max - min;
+    if (span <= 0) return { step: 1, ticks: [min] };
+    const rough = span / target;
+    const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+    const norm = rough / mag;
+    const step = (norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10) * mag;
+    const start = Math.ceil(min / step) * step;
+    const ticks = [];
+    for (let v = start; v <= max + 1e-9; v += step) ticks.push(v);
+    return { step, ticks };
+  }
+
+  function linreg(pts) {
+    const n = pts.length;
+    let sx=0, sy=0, sxx=0, sxy=0;
+    for (const [x,y] of pts) { sx+=x; sy+=y; sxx+=x*x; sxy+=x*y; }
+    const denom = n*sxx - sx*sx;
+    if (!denom) return null;
+    const slope = (n*sxy - sx*sy) / denom;
+    const intercept = (sy - slope*sx) / n;
+    return { slope, intercept };
+  }
+
   function renderChart(samples) {
     const info = MAP_INFO[mapParam] || DEFAULT_INFO;
     chartLegend.innerHTML = '';
     chartHint.textContent = '';
 
-    const W = 800, H = 280, padL = 60, padR = 20, padT = 15, padB = 40;
+    const W = 900, H = 320, padL = 64, padR = 24, padT = 18, padB = 52;
     const innerW = W - padL - padR, innerH = H - padT - padB;
     const n = samples.length;
     if (!n) { chartEl.innerHTML = ''; return; }
@@ -290,69 +321,162 @@
     const valid = samples.filter(s => s.value != null);
     if (!valid.length) {
       chartEl.innerHTML = '';
-      chartHint.textContent = 'Todos los pixeles del parche eran blancos. Prueba un punto distinto.';
+      chartHint.textContent = 'Todos los pixeles del parche eran blancos/negros. Prueba un punto distinto.';
       return;
     }
 
-    let yMin = Math.min(...valid.map(s => s.value));
-    let yMax = Math.max(...valid.map(s => s.value));
-    const span = yMax - yMin || 1;
-    yMin -= span * 0.1;
-    yMax += span * 0.1;
+    const points = samples.map(s => ({ t: new Date(s.frame.run).getTime(), v: s.value, raw: s }));
+    const validPts = points.filter(p => p.v != null);
+    const tMin = points[0].t;
+    const tMaxData = points[points.length-1].t;
+    const today = Date.now();
+    const tMax = Math.max(tMaxData, today);
 
-    const seriesLabel = `${info.field} (${info.unit})`;
-    chartLegend.innerHTML = `<span><span class="swatch" style="background:#58a6ff"></span>${seriesLabel}</span>`;
+    const reg = validPts.length >= 2
+      ? linreg(validPts.map(p => [p.t, p.v]))
+      : null;
 
-    const avgCount = (samples.reduce((a, s) => a + (s.count||0), 0) / n).toFixed(1);
-    const maxDist = Math.max(...samples.map(s => s.maxDist || 0));
-    chartHint.textContent = `Parche 5x5, blancos descartados (~${avgCount} px utiles/frame). ` +
-      `Rango LUT: ${info.vmin}-${info.vmax} ${info.unit}. ` +
-      `Distancia max color->LUT: ${Math.round(maxDist)}.`;
+    let yMin = Math.min(...validPts.map(p => p.v));
+    let yMax = Math.max(...validPts.map(p => p.v));
+    if (reg) {
+      yMin = Math.min(yMin, reg.slope*tMin + reg.intercept, reg.slope*tMax + reg.intercept);
+      yMax = Math.max(yMax, reg.slope*tMin + reg.intercept, reg.slope*tMax + reg.intercept);
+    }
+    const yPad = (yMax - yMin || 1) * 0.08;
+    yMin -= yPad; yMax += yPad;
 
-    const xAt = i => padL + (n === 1 ? innerW/2 : (i / (n-1)) * innerW);
+    const yT = niceTicks(yMin, yMax, 8);
+    yMin = Math.min(yMin, yT.ticks[0]);
+    yMax = Math.max(yMax, yT.ticks[yT.ticks.length-1]);
+
+    const xAt = t => padL + ((t - tMin) / (tMax - tMin || 1)) * innerW;
     const yAt = v => padT + innerH - ((v - yMin) / (yMax - yMin || 1)) * innerH;
+
+    const dayMs = 24 * 3600 * 1000;
+    const totalDays = (tMax - tMin) / dayMs;
+    const tickStepHours = totalDays > 18 ? 48 : totalDays > 9 ? 24 : totalDays > 4 ? 12 : 6;
+    const tickStepMs = tickStepHours * 3600 * 1000;
+    const startTick = Math.ceil(tMin / tickStepMs) * tickStepMs;
+
+    const decimals = yT.step >= 10 ? 0 : yT.step >= 1 ? 1 : 2;
+    const fmtY = v => v.toFixed(decimals);
 
     let svg = '';
 
-    const yTicks = 5;
-    for (let t = 0; t <= yTicks; t++) {
-      const v = yMin + (yMax - yMin) * (t / yTicks);
+    // Y grid + labels
+    yT.ticks.forEach(v => {
       const y = yAt(v);
       svg += `<line class="chart-grid" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;
-      svg += `<text class="chart-label" x="${padL-6}" y="${y+3}" text-anchor="end">${v.toFixed(1)}</text>`;
-    }
-    svg += `<text class="chart-label" x="14" y="${padT+innerH/2}" transform="rotate(-90 14 ${padT+innerH/2})" text-anchor="middle">${info.unit || 'valor'}</text>`;
-
-    const labelEvery = Math.max(1, Math.ceil(n / 8));
-    samples.forEach((s, i) => {
-      if (i % labelEvery !== 0 && i !== n-1) return;
-      const d = new Date(s.frame.run);
-      const pad = x => String(x).padStart(2,'0');
-      const lbl = `${pad(d.getUTCDate())}/${pad(d.getUTCMonth()+1)} ${pad(d.getUTCHours())}Z`;
-      svg += `<text class="chart-label" x="${xAt(i)}" y="${H-padB+15}" text-anchor="middle">${lbl}</text>`;
+      svg += `<text class="chart-label" x="${padL-8}" y="${y+3}" text-anchor="end">${fmtY(v)}</text>`;
     });
 
-    if (idx >= 0 && idx < n) {
-      svg += `<line class="chart-current" x1="${xAt(idx)}" y1="${padT}" x2="${xAt(idx)}" y2="${padT+innerH}"/>`;
+    // Y axis title
+    svg += `<text class="chart-axis-title" x="16" y="${padT+innerH/2}" transform="rotate(-90 16 ${padT+innerH/2})" text-anchor="middle">${info.field} (${info.unit})</text>`;
+
+    // X grid + labels (multi-fila: dia/mes y hora)
+    const padN = x => String(x).padStart(2,'0');
+    let lastDay = '';
+    for (let t = startTick; t <= tMax + 1e-3; t += tickStepMs) {
+      const x = xAt(t);
+      const d = new Date(t);
+      svg += `<line class="chart-grid" x1="${x}" y1="${padT}" x2="${x}" y2="${padT+innerH}"/>`;
+      svg += `<line class="chart-tick" x1="${x}" y1="${padT+innerH}" x2="${x}" y2="${padT+innerH+4}"/>`;
+      const isMidnight = d.getUTCHours() === 0;
+      const dayLbl = `${padN(d.getUTCDate())}/${padN(d.getUTCMonth()+1)}`;
+      const hourLbl = `${padN(d.getUTCHours())}Z`;
+      if (isMidnight || tickStepHours >= 24) {
+        if (dayLbl !== lastDay) {
+          svg += `<text class="chart-label chart-label-strong" x="${x}" y="${H-padB+14}" text-anchor="middle">${dayLbl}</text>`;
+          lastDay = dayLbl;
+        } else {
+          svg += `<text class="chart-label" x="${x}" y="${H-padB+14}" text-anchor="middle">${hourLbl}</text>`;
+        }
+      } else {
+        svg += `<text class="chart-label" x="${x}" y="${H-padB+14}" text-anchor="middle">${hourLbl}</text>`;
+        if (dayLbl !== lastDay) {
+          svg += `<text class="chart-label chart-label-strong" x="${x}" y="${H-padB+28}" text-anchor="middle">${dayLbl}</text>`;
+          lastDay = dayLbl;
+        }
+      }
     }
 
-    // Linea + puntos, conectando solo segmentos con valor valido.
+    // Marcador "hoy"
+    const xToday = xAt(today);
+    svg += `<line class="chart-today" x1="${xToday}" y1="${padT}" x2="${xToday}" y2="${padT+innerH}"/>`;
+    svg += `<text class="chart-label chart-today-label" x="${xToday}" y="${padT-5}" text-anchor="middle">hoy</text>`;
+
+    // Marcador frame actual
+    const curT = points[idx] ? points[idx].t : tMin;
+    svg += `<line class="chart-current" x1="${xAt(curT)}" y1="${padT}" x2="${xAt(curT)}" y2="${padT+innerH}"/>`;
+
+    // Area bajo la curva
+    let areaPath = '';
+    let segStart = null;
+    points.forEach((p, i) => {
+      if (p.v == null) {
+        if (segStart != null) {
+          const last = points[i-1];
+          areaPath += `L${xAt(last.t)},${yAt(yMin)} L${xAt(segStart)},${yAt(yMin)} Z `;
+          segStart = null;
+        }
+        return;
+      }
+      if (segStart == null) {
+        areaPath += `M${xAt(p.t)},${yAt(p.v)} `;
+        segStart = p.t;
+      } else {
+        areaPath += `L${xAt(p.t)},${yAt(p.v)} `;
+      }
+      if (i === points.length-1 && segStart != null) {
+        areaPath += `L${xAt(p.t)},${yAt(yMin)} L${xAt(segStart)},${yAt(yMin)} Z `;
+      }
+    });
+    if (areaPath) svg += `<path class="chart-area" d="${areaPath}"/>`;
+
+    // Linea de tendencia (extendida hasta hoy)
+    if (reg) {
+      const yA = reg.slope*tMin + reg.intercept;
+      const yB = reg.slope*tMax + reg.intercept;
+      svg += `<line class="chart-trend" x1="${xAt(tMin)}" y1="${yAt(yA)}" x2="${xAt(tMax)}" y2="${yAt(yB)}"/>`;
+    }
+
+    // Linea de valores
     let pathD = '', penDown = false;
-    samples.forEach((s, i) => {
-      if (s.value == null) { penDown = false; return; }
-      pathD += (penDown ? 'L' : 'M') + xAt(i) + ',' + yAt(s.value) + ' ';
+    points.forEach(p => {
+      if (p.v == null) { penDown = false; return; }
+      pathD += (penDown ? 'L' : 'M') + xAt(p.t) + ',' + yAt(p.v) + ' ';
       penDown = true;
     });
-    svg += `<path class="chart-line" stroke="#58a6ff" d="${pathD}"/>`;
-    samples.forEach((s, i) => {
-      if (s.value == null) return;
-      svg += `<circle class="chart-dot" cx="${xAt(i)}" cy="${yAt(s.value)}" r="2.5" fill="#58a6ff"/>`;
+    svg += `<path class="chart-line" d="${pathD}"/>`;
+
+    // Puntos
+    points.forEach(p => {
+      if (p.v == null) return;
+      svg += `<circle class="chart-dot" cx="${xAt(p.t)}" cy="${yAt(p.v)}" r="3"/>`;
     });
 
+    // Ejes
     svg += `<line class="chart-axis" x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT+innerH}"/>`;
     svg += `<line class="chart-axis" x1="${padL}" y1="${padT+innerH}" x2="${W-padR}" y2="${padT+innerH}"/>`;
 
     chartEl.innerHTML = svg;
+
+    // Leyenda
+    chartLegend.innerHTML = `
+      <span><span class="swatch" style="background:#58a6ff"></span>${info.field} (${info.unit})</span>
+      ${reg ? '<span><span class="swatch" style="background:#ffa657"></span>Tendencia</span>' : ''}
+      <span><span class="swatch" style="background:#f85149"></span>Hoy</span>
+    `;
+
+    const avgCount = (samples.reduce((a, s) => a + (s.count||0), 0) / n).toFixed(1);
+    let trendTxt = '';
+    if (reg) {
+      const perDay = reg.slope * dayMs;
+      const sign = perDay >= 0 ? '+' : '';
+      trendTxt = `Tendencia: ${sign}${perDay.toFixed(2)} ${info.unit}/dia.`;
+    }
+    chartHint.textContent = `Parche 5x5, blancos y negros descartados (~${avgCount} px utiles/frame). ` +
+      `Rango LUT: ${info.vmin}-${info.vmax} ${info.unit}. ${trendTxt}`;
   }
 
   let lastSamples = null;
