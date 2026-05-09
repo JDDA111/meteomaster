@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GFS forecast evolution animator</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --ok: #3fb950; --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 1.5rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); }
+  h1 { font-size: 18px; font-weight: 500; margin: 0 0 1rem; }
+  .meta { font-size: 13px; color: var(--muted); margin-bottom: 1rem; line-height: 1.6; }
+  .meta code { background: var(--panel); padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+  .viewer { position: relative; background: var(--panel); border: 1px solid var(--border);
+            border-radius: 8px; overflow: hidden; min-height: 400px;
+            display: flex; align-items: center; justify-content: center; }
+  .viewer img { max-width: 100%; height: auto; display: block; }
+  .overlay { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.75);
+             padding: 6px 10px; border-radius: 6px; font-family: ui-monospace, monospace;
+             font-size: 12px; pointer-events: none; }
+  .controls { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+  .controls input[type=range] { flex: 1; }
+  .controls button { background: var(--panel); color: var(--text); border: 1px solid var(--border);
+                     padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+                     min-width: 90px; }
+  .controls button:hover { border-color: var(--accent); }
+  .readout { font-family: ui-monospace, monospace; font-size: 13px; min-width: 70px; text-align: right; }
+  details { margin-top: 1rem; font-size: 12px; color: var(--muted); }
+  details pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+                padding: 10px; max-height: 300px; overflow: auto; font-size: 11px; line-height: 1.5; }
+  .err { color: var(--err); }
+  .ok { color: var(--ok); }
+</style>
+</head>
+<body>
+<h1>GFS forecast evolution animator</h1>
+<div id="meta" class="meta">Cargando manifest...</div>
+
+<div class="viewer">
+  <img id="map" alt="Mapa GFS">
+  <div id="overlay" class="overlay"></div>
+</div>
+
+<div class="controls">
+  <button id="play">Play</button>
+  <input type="range" id="slider" min="0" max="0" value="0" step="1">
+  <span class="readout" id="readout">0 / 0</span>
+</div>
+
+<div class="controls">
+  <span style="font-size: 13px; color: var(--muted);">Velocidad</span>
+  <input type="range" id="speed" min="100" max="2000" value="500" step="50">
+  <span class="readout" id="speed-readout">500 ms</span>
+</div>
+
+<details>
+  <summary style="cursor: pointer;">Log de descarga</summary>
+  <pre id="log">Cargando...</pre>
+</details>
+
+<script>
+(async function() {
+  const meta = document.getElementById('meta');
+  const map = document.getElementById('map');
+  const overlay = document.getElementById('overlay');
+  const slider = document.getElementById('slider');
+  const readout = document.getElementById('readout');
+  const playBtn = document.getElementById('play');
+  const speedEl = document.getElementById('speed');
+  const speedReadout = document.getElementById('speed-readout');
+  const logEl = document.getElementById('log');
+
+  let frames = [], idx = 0, playing = false, timer = null;
+
+  try {
+    const r = await fetch('frames/manifest.json');
+    const manifest = await r.json();
+    frames = manifest.frames || [];
+    const s = manifest.stats || {};
+    meta.innerHTML = `
+      Objetivo: <code>${manifest.target_date} ${String(manifest.target_hour).padStart(2,'0')}Z</code> ·
+      Mapa: <code>${manifest.map_param}</code> ·
+      Archivo: ${manifest.days_back} dias ·
+      <span class="ok">${s.ok} OK</span> / <span class="err">${s.fail} fail</span> de ${s.total_candidates} ·
+      Generado ${new Date(manifest.generated_at).toLocaleString()}
+    `;
+  } catch (e) {
+    meta.innerHTML = `<span class="err">Error cargando manifest.json: ${e.message}</span>`;
+    return;
+  }
+
+  try {
+    const r = await fetch('frames/log.txt');
+    logEl.textContent = await r.text();
+  } catch(e) {
+    logEl.textContent = '(no log)';
+  }
+
+  if (!frames.length) {
+    meta.innerHTML += '<br><span class="err">No hay frames disponibles.</span>';
+    return;
+  }
+
+  slider.max = frames.length - 1;
+
+  function show(i) {
+    idx = Math.max(0, Math.min(frames.length - 1, i));
+    const f = frames[idx];
+    map.src = 'frames/' + f.file;
+    const runDate = new Date(f.run);
+    const pad = n => String(n).padStart(2, '0');
+    const runStr = `${runDate.getUTCFullYear()}-${pad(runDate.getUTCMonth()+1)}-${pad(runDate.getUTCDate())} ${pad(runDate.getUTCHours())}Z`;
+    overlay.textContent = `Run ${runStr} · +${f.fh}h`;
+    slider.value = idx;
+    readout.textContent = `${idx+1} / ${frames.length}`;
+  }
+
+  function step() { show((idx + 1) % frames.length); }
+
+  function play() {
+    playing = true;
+    playBtn.textContent = 'Pause';
+    timer = setInterval(step, parseInt(speedEl.value, 10));
+  }
+  function stop() {
+    playing = false;
+    playBtn.textContent = 'Play';
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+
+  playBtn.onclick = () => playing ? stop() : play();
+  slider.oninput = e => { stop(); show(parseInt(e.target.value, 10)); };
+  speedEl.oninput = e => {
+    speedReadout.textContent = `${e.target.value} ms`;
+    if (playing) { stop(); play(); }
+  };
+
+  document.addEventListener('keydown', e => {
+    if (e.key === ' ') { e.preventDefault(); playing ? stop() : play(); }
+    if (e.key === 'ArrowLeft') { stop(); show(idx - 1); }
+    if (e.key === 'ArrowRight') { stop(); show(idx + 1); }
+  });
+
+  show(0);
+})();
+</script>
+</body>
+</html>

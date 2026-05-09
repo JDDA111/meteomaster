@@ -1,0 +1,78 @@
+name: Build GFS forecast evolution
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "Fecha objetivo (YYYY-MM-DD, UTC)"
+        required: true
+        default: "2026-05-15"
+      target_hour:
+        description: "Hora UTC objetivo (0, 6, 12 o 18)"
+        required: true
+        default: "12"
+      days_back:
+        description: "Dias hacia atras de archivo de runs (1-15)"
+        required: true
+        default: "10"
+      map_param:
+        description: "Mapa GFS (gfs-0 = RR/PrMSL/Nebu, gfs-1 = precipitaciones, etc.)"
+        required: true
+        default: "gfs-0"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Download forecast frames
+        run: |
+          python scripts/fetch_frames.py \
+            --target-date "${{ inputs.target_date }}" \
+            --target-hour "${{ inputs.target_hour }}" \
+            --days-back "${{ inputs.days_back }}" \
+            --map-param "${{ inputs.map_param }}" \
+            --out-dir site/frames \
+            --manifest site/frames/manifest.json \
+            --log site/frames/log.txt
+
+      - name: Show log tail
+        if: always()
+        run: tail -n 80 site/frames/log.txt || true
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
