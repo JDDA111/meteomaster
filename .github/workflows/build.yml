@@ -1,5 +1,6 @@
 name: Build GFS forecast evolution
 
+# Manual workflow to fetch GFS forecast frames and deploy to Pages.
 on:
   workflow_dispatch:
     inputs:
